@@ -46,6 +46,55 @@ function Invoke-GithubSsoLogin {
     if ($LASTEXITCODE -ne 0) { throw "'gh auth login' did not complete successfully." }
 }
 
+function Invoke-GhApi {
+    <#
+    Keeps `gh api`'s stdout and stderr apart and reports its exit code, so a failed fetch's error
+    text is never mistaken for script content. The preference is scoped to this function because
+    Windows PowerShell 5.1 turns redirected native stderr into a terminating error under "Stop".
+    #>
+    param([string[]]$Arguments)
+    $ErrorActionPreference = "Continue"
+    $lines = & gh api @Arguments 2>&1
+    $isError = { $_ -is [System.Management.Automation.ErrorRecord] }
+    [pscustomobject]@{
+        Succeeded = ($LASTEXITCODE -eq 0)
+        Output    = ($lines | Where-Object { -not (& $isError) } | Out-String)
+        Error     = (($lines | Where-Object $isError | ForEach-Object { $_.ToString() }) -join "`n")
+    }
+}
+
+function Test-SamlBlocked {
+    param($Result)
+    return (-not $Result.Succeeded) -and ($Result.Error -match "SAML enforcement")
+}
+
+function Get-SsoAuthorizationUrl {
+    param([string[]]$Arguments)
+    $response = Invoke-GhApi (@("-i") + $Arguments)
+    if (($response.Output + $response.Error) -match "https://github\.com/enterprises/[^/\s]+/sso\?authorization_request=[A-Za-z0-9]+") {
+        return $Matches[0]
+    }
+    return $null
+}
+
+function Read-SsoAuthorizedToken {
+    <#
+    Some `gh auth login` tokens never take an SSO grant: after opening the authorization link
+    GitHub returns, the same token keeps failing with the SAML 403. A classic personal
+    access token authorized through the token page's own "Configure SSO" button does take the grant
+    for the same account, so it is the fallback once the link has failed.
+    #>
+    Write-Host "`nGitHub still refuses the GitHub CLI's sign-in token for Springbrook's SSO. A personal"
+    Write-Host "access token works instead, for this PowerShell window only:"
+    Write-Host "  1. In the page that opens, signed in as your '..._sprbrkgh' account, set Expiration to 7 days"
+    Write-Host "     and click 'Generate token' (the 'repo' and 'read:org' scopes are already ticked)."
+    Write-Host "  2. Copy the token, then click 'Configure SSO' next to it and 'Authorize' springbrooksoftware."
+    Write-Host "  3. Paste the token below.`n"
+    Start-Process "https://github.com/settings/tokens/new?scopes=repo,read:org&description=Start-DevRepoRemoteUpdate"
+    $secure = Read-Host "Paste the token (input is hidden; press Enter alone to give up)" -AsSecureString
+    return [System.Net.NetworkCredential]::new("", $secure).Password
+}
+
 # The handoff fetch below reads a Springbrook-internal (not public) repo, so it only succeeds for
 # an account that's a member of the springbrooksoftware enterprise -- which for Springbrook means
 # a "..._sprbrkgh"-suffixed Enterprise Managed User account, never a personal GitHub account. This
@@ -86,4 +135,59 @@ while ($true) {
     Invoke-GithubSsoLogin
 }
 
-gh api repos/Sprbrk-POC/benp-dev-tooling/contents/Update-DevRepoRemote.ps1 -H "Accept: application/vnd.github.raw" | Out-String | iex
+# Being signed in as the right account isn't enough: every token also needs its own SSO grant, and
+# without one this fetch fails with a SAML-enforcement 403. The authorization link GitHub returns
+# grants it for the current token, so it comes first; a personal access token is the fallback.
+$handoffFetch = @("repos/Sprbrk-POC/benp-dev-tooling/contents/Update-DevRepoRemote.ps1", "-H", "Accept: application/vnd.github.raw")
+$fetch = Invoke-GhApi $handoffFetch
+
+if (Test-SamlBlocked $fetch) {
+    $ssoUrl = Get-SsoAuthorizationUrl $handoffFetch
+    if ($ssoUrl) {
+        Write-Host "`nYour GitHub CLI sign-in needs a one-time approval for Springbrook's SSO. Opening the"
+        Write-Host "approval page -- sign in as your '..._sprbrkgh' account if asked, and approve it:"
+        Write-Host "  $ssoUrl`n"
+        Start-Process $ssoUrl
+        Read-Host "Press Enter once GitHub says the authorization succeeded"
+        $fetch = Invoke-GhApi $handoffFetch
+    }
+}
+
+$previousGhToken = $env:GH_TOKEN
+$usingOwnToken = $false
+while (Test-SamlBlocked $fetch) {
+    $token = Read-SsoAuthorizedToken
+    if (-not $token) {
+        if ($usingOwnToken) { $env:GH_TOKEN = $previousGhToken }
+        throw "GitHub's SSO still blocks access to Springbrook's repos -- re-run this command once your token is authorized."
+    }
+    $env:GH_TOKEN = $token
+    $usingOwnToken = $true
+
+    $tokenLogin = (Invoke-GhApi @("user", "--jq", ".login")).Output.Trim()
+    if (-not $tokenLogin) {
+        Write-Warning "GitHub didn't accept that token -- check it was copied in full."
+        continue
+    }
+    if ($tokenLogin -notmatch "_sprbrkgh$") {
+        Write-Warning "That token belongs to '$tokenLogin', not a '..._sprbrkgh' Springbrook account -- create it while signed in to GitHub as your company account."
+        continue
+    }
+    $fetch = Invoke-GhApi $handoffFetch
+}
+
+if (-not $fetch.Succeeded) {
+    if ($usingOwnToken) { $env:GH_TOKEN = $previousGhToken }
+    throw "Couldn't download the retarget script from Sprbrk-POC/benp-dev-tooling: $($fetch.Error.Trim())"
+}
+
+try {
+    $fetch.Output | iex
+}
+finally {
+    if ($usingOwnToken) {
+        $env:GH_TOKEN = $previousGhToken
+        Write-Host "`nThe personal access token is no longer used by this window. Delete it at"
+        Write-Host "https://github.com/settings/tokens once you're done retargeting."
+    }
+}
