@@ -95,49 +95,57 @@ function Read-SsoAuthorizedToken {
     return [System.Net.NetworkCredential]::new("", $secure).Password
 }
 
-# The handoff fetch below reads a Springbrook-internal (not public) repo, so it only succeeds for
-# an account that's a member of the springbrooksoftware enterprise -- which for Springbrook means
-# a "..._sprbrkgh"-suffixed Enterprise Managed User account, never a personal GitHub account. This
-# has to be checked here, before the fetch: a wrong/missing sign-in makes that fetch 404 with no
-# auth-specific hint, and the real script's own identity check can't run yet because it lives in
-# the very file this fetch would return.
-while ($true) {
-    $statusJson = gh auth status --hostname github.com --json hosts 2>$null
-    $accounts = if ($LASTEXITCODE -eq 0 -and $statusJson) { ($statusJson | ConvertFrom-Json).hosts.'github.com' } else { $null }
+function Confirm-SpringbrookSignIn {
+    <#
+    The handoff fetch below reads a Springbrook-internal (not public) repo, so it only succeeds for
+    an account that's a member of the springbrooksoftware enterprise -- which for Springbrook means
+    a "..._sprbrkgh"-suffixed Enterprise Managed User account, never a personal GitHub account. This
+    has to be checked here, before the fetch: a wrong/missing sign-in makes that fetch 404 with no
+    auth-specific hint, and the real script's own identity check can't run yet because it lives in
+    the very file this fetch would return.
+    #>
+    while ($true) {
+        $statusJson = gh auth status --hostname github.com --json hosts 2>$null
+        $accounts = if ($LASTEXITCODE -eq 0 -and $statusJson) { ($statusJson | ConvertFrom-Json).hosts.'github.com' } else { $null }
 
-    if (-not $accounts) {
-        Invoke-GithubSsoLogin
-        continue
-    }
+        if (-not $accounts) {
+            Invoke-GithubSsoLogin
+            continue
+        }
 
-    $active = $accounts | Where-Object { $_.active }
-    if ($active -and $active.login -match "_sprbrkgh$") { break }
+        $active = $accounts | Where-Object { $_.active }
+        if ($active -and $active.login -match "_sprbrkgh$") { return }
 
-    # The right account might already be signed in under a different (inactive) account on this
-    # host -- switching is instant and needs no browser round-trip, unlike a fresh 'gh auth login'.
-    $known = $accounts | Where-Object { $_.login -match "_sprbrkgh$" } | Select-Object -First 1
-    if ($known) {
-        Write-Host "`ngh is signed in as '$($active.login)', but '$($known.login)' (a Springbrook-managed account) is already signed in too -- just not active."
-        if (-not (Confirm-Prompt "Switch the active account to '$($known.login)'?")) {
+        # The right account might already be signed in under a different (inactive) account on this
+        # host -- switching is instant and needs no browser round-trip, unlike a fresh 'gh auth login'.
+        $known = $accounts | Where-Object { $_.login -match "_sprbrkgh$" } | Select-Object -First 1
+        if ($known) {
+            Write-Host "`ngh is signed in as '$($active.login)', but '$($known.login)' (a Springbrook-managed account) is already signed in too -- just not active."
+            if (-not (Confirm-Prompt "Switch the active account to '$($known.login)'?")) {
+                throw "Active gh account '$($active.login)' is not a Springbrook-managed account."
+            }
+            gh auth switch --hostname github.com --user $known.login | Out-Null
+            continue
+        }
+
+        Write-Warning "gh is signed in as '$($active.login)', which doesn't look like a Springbrook-managed account (expected a '..._sprbrkgh' login)."
+        Write-Host "This usually means gh is signed in with a personal GitHub account instead of your"
+        Write-Host "company one. Sign in with your company account through your company SSO -- this opens"
+        Write-Host "your browser:`n"
+        if (-not (Confirm-Prompt "Sign in with your Springbrook account now?")) {
             throw "Active gh account '$($active.login)' is not a Springbrook-managed account."
         }
-        gh auth switch --hostname github.com --user $known.login | Out-Null
-        continue
+        Invoke-GithubSsoLogin
     }
-
-    Write-Warning "gh is signed in as '$($active.login)', which doesn't look like a Springbrook-managed account (expected a '..._sprbrkgh' login)."
-    Write-Host "This usually means gh is signed in with a personal GitHub account instead of your"
-    Write-Host "company one. Sign in with your company account through your company SSO -- this opens"
-    Write-Host "your browser:`n"
-    if (-not (Confirm-Prompt "Sign in with your Springbrook account now?")) {
-        throw "Active gh account '$($active.login)' is not a Springbrook-managed account."
-    }
-    Invoke-GithubSsoLogin
 }
 
+Confirm-SpringbrookSignIn
+
 # Being signed in as the right account isn't enough: every token also needs its own SSO grant, and
-# without one this fetch fails with a SAML-enforcement 403. The authorization link GitHub returns
-# grants it for the current token, so it comes first; a personal access token is the fallback.
+# without one this fetch fails with a SAML-enforcement 403. Recovery escalates from least to most
+# effort: the authorization link GitHub returns for the current token, then one fresh sign-in (a
+# new token approved right after a company SSO sign-in can carry the grant even when the link
+# failed for the old one), then a personal access token.
 $handoffFetch = @("repos/Sprbrk-POC/benp-dev-tooling/contents/Update-DevRepoRemote.ps1", "-H", "Accept: application/vnd.github.raw")
 $fetch = Invoke-GhApi $handoffFetch
 
@@ -149,6 +157,16 @@ if (Test-SamlBlocked $fetch) {
         Write-Host "  $ssoUrl`n"
         Start-Process $ssoUrl
         Read-Host "Press Enter once GitHub says the authorization succeeded"
+        $fetch = Invoke-GhApi $handoffFetch
+    }
+}
+
+if (Test-SamlBlocked $fetch) {
+    Write-Host "`nThis GitHub CLI sign-in still isn't approved for Springbrook's SSO. Signing in again,"
+    Write-Host "through your company SSO first, can give the GitHub CLI a new, approved token.`n"
+    if (Confirm-Prompt "Sign in to the GitHub CLI again now?") {
+        Invoke-GithubSsoLogin
+        Confirm-SpringbrookSignIn
         $fetch = Invoke-GhApi $handoffFetch
     }
 }
