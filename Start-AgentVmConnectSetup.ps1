@@ -147,7 +147,7 @@ itself carries no Springbrook-specific data -- it only gets `gh` ready to fetch 
     # effort: the authorization link GitHub returns for the current token, then one fresh sign-in (a
     # new token approved right after a company SSO sign-in can carry the grant even when the link
     # failed for the old one), then a personal access token.
-    $handoffFetch = @("repos/Sprbrk-POC/benp-dev-tooling/contents/Setup-AgentVmConnect.ps1", "-H", "Accept: application/vnd.github.raw")
+    $handoffFetch = @("repos/Sprbrk-POC/benp-dev-tooling/contents/agent-vm/Setup-AgentVmConnect.ps1", "-H", "Accept: application/vnd.github.raw")
     $fetch = Invoke-GhApi $handoffFetch
 
     if (Test-SamlBlocked $fetch) {
